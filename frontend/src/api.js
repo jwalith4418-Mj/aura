@@ -67,10 +67,38 @@ export async function teach(sid, target) {
   });
 }
 
-export async function verifyTransfer(sid, passed, note) {
+export async function markOriginalRecovered(sid, passed, note, originalProblemId) {
+  return fetchApi(`/session/${sid}/mark-recovered`, {
+    method: 'POST',
+    body: JSON.stringify({
+      passed,
+      note,
+      original_problem_id: originalProblemId || undefined,
+    }),
+  });
+}
+
+export async function getTransferProblem(sid) {
+  return fetchApi(`/session/${sid}/transfer-problem`);
+}
+
+export async function verifyTransfer(
+  sid,
+  passed,
+  note,
+  transferProblemId,
+  originalProblemId,
+  structurallyDifferent,
+) {
   return fetchApi(`/session/${sid}/verify-transfer`, {
     method: 'POST',
-    body: JSON.stringify({ passed, note }),
+    body: JSON.stringify({
+      passed,
+      note,
+      transfer_problem_id: transferProblemId,
+      original_problem_id: originalProblemId,
+      structurally_different: structurallyDifferent === true,
+    }),
   });
 }
 

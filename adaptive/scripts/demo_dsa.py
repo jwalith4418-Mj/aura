@@ -171,6 +171,9 @@ def main() -> None:
 
     print("\n[9] TRANSFER VERIFICATION - structurally different problem, same concept\n")
     transfer_item = select_transfer_problem(pack.items, "binary_search")
+    if transfer_item is None:
+        print("    No same-concept transfer problem is available; recovery remains unverified.")
+        return
     print(f"    TRANSFER PROBLEM ({transfer_item.id}):")
     print(f"      {transfer_item.prompt}")
     print("    ```python")
@@ -180,7 +183,15 @@ def main() -> None:
         TRANSFER_CODE,
         [([1, 1, 2, 2, 3], 2, 2), ([5], 5, 0), ([1, 2, 3], 4, -1), ([2, 2, 2, 2], 2, 0)],
     )
-    check = make_transfer_check(transfer_item, original_problem_id=None, passed=passed, note=note)
+    # This demo explicitly selects the first-occurrence variant as a structurally
+    # different transfer task; the helper does not infer that from the ID alone.
+    check = make_transfer_check(
+        transfer_item,
+        original_problem_id=None,
+        passed=passed,
+        note=note,
+        structurally_different=True,
+    )
     session.gaps.verify_transfer(gap, check)
 
     print(f"    transfer evaluation: {note}")

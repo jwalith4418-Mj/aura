@@ -11,6 +11,8 @@ from adaptive.types import (
     GAP_RECOVERED_PENDING_TRANSFER,
     Event,
     GapHypothesis,
+    Question,
+    TransferCheck,
 )
 
 
@@ -50,7 +52,7 @@ class TestGapLifecycle(unittest.TestCase):
         self.registry.mark_original_recovered(gap, {"retry": "passed"})
         transfer = select_transfer_problem(self.pack.items, "binary_search")
         self.assertIsNotNone(transfer)
-        check = make_transfer_check(transfer, None, passed=True)
+        check = make_transfer_check(transfer, None, passed=True, structurally_different=True)
         self.registry.verify_transfer(gap, check)
         self.assertEqual(gap.status, GAP_RECOVERED)
         self.assertTrue(gap.transfer_verified)
@@ -60,10 +62,81 @@ class TestGapLifecycle(unittest.TestCase):
         self.registry.mark_intervention_applied(gap, "int-1")
         self.registry.mark_original_recovered(gap, {"retry": "passed"})
         transfer = select_transfer_problem(self.pack.items, "binary_search")
-        check = make_transfer_check(transfer, None, passed=False)
+        check = make_transfer_check(transfer, None, passed=False, structurally_different=True)
         self.registry.verify_transfer(gap, check)
         self.assertEqual(gap.status, GAP_ACTIVE_BLOCKER)
         self.assertFalse(gap.transfer_verified)
+
+    def test_transfer_cannot_skip_original_reassessment(self):
+        gap = self.registry.materialize("binary_search", self.hyp, self.event, self.pack.graph, self.state)
+        transfer = select_transfer_problem(self.pack.items, "binary_search")
+        check = make_transfer_check(transfer, None, passed=True, structurally_different=True)
+
+        self.registry.verify_transfer(gap, check)
+
+        self.assertEqual(gap.status, GAP_ACTIVE_BLOCKER)
+        self.assertFalse(gap.transfer_verified)
+
+    def test_wrong_concept_transfer_cannot_verify_recovery(self):
+        gap = self.registry.materialize("binary_search", self.hyp, self.event, self.pack.graph, self.state)
+        self.registry.mark_intervention_applied(gap, "int-1")
+        self.registry.mark_original_recovered(gap, {"retry": "passed"})
+        check = TransferCheck(
+            transfer_problem_id="biology-item",
+            concept_id="cell_organelles",
+            original_problem_id="original-item",
+            prompt="Different domain",
+            structurally_different=True,
+            passed=True,
+        )
+
+        self.registry.verify_transfer(gap, check)
+
+        self.assertEqual(gap.status, GAP_RECOVERED_PENDING_TRANSFER)
+        self.assertFalse(gap.transfer_verified)
+
+    def test_transfer_check_does_not_infer_structure_from_a_different_id(self):
+        transfer = select_transfer_problem(self.pack.items, "binary_search")
+        check = make_transfer_check(transfer, None, passed=True)
+
+        self.assertFalse(check.structurally_different)
+
+        gap = self.registry.materialize("binary_search", self.hyp, self.event, self.pack.graph, self.state)
+        self.registry.mark_intervention_applied(gap, "int-1")
+        self.registry.mark_original_recovered(gap, {"retry": "passed"})
+        self.registry.verify_transfer(gap, check)
+
+        self.assertEqual(gap.status, GAP_RECOVERED_PENDING_TRANSFER)
+        self.assertFalse(gap.transfer_verified)
+
+    def test_same_problem_cannot_count_as_transfer(self):
+        gap = self.registry.materialize("binary_search", self.hyp, self.event, self.pack.graph, self.state)
+        self.registry.mark_intervention_applied(gap, "int-1")
+        self.registry.mark_original_recovered(gap, {"retry": "passed"})
+        transfer = select_transfer_problem(self.pack.items, "binary_search")
+        check = make_transfer_check(transfer, transfer.id, passed=True, structurally_different=True)
+
+        self.registry.verify_transfer(gap, check)
+
+        self.assertEqual(gap.status, GAP_RECOVERED_PENDING_TRANSFER)
+        self.assertFalse(gap.transfer_verified)
+
+    def test_transfer_selection_never_falls_back_to_an_unrelated_concept(self):
+        unrelated = Question(
+            id="biology-item",
+            concept_id="cell_organelles",
+            kind="practice",
+            prompt="An unrelated question",
+            options=["A", "B"],
+        )
+
+        self.assertIsNone(
+            select_transfer_problem(
+                [unrelated],
+                concept_id="binary_search",
+                original_problem_id="original-item",
+            )
+        )
 
     def test_low_confidence_materializes_as_candidate(self):
         low = GapHypothesis("mc_off_by_one", "misconception", 0.2, 0.4, recurrence_count=0)

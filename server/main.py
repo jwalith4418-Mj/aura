@@ -9,7 +9,6 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
@@ -20,6 +19,7 @@ from server.schemas import (
     StartSessionRequest,
     ObserveRequest,
     AnswerDiagnosticRequest,
+    MarkRecoveredRequest,
     TransferVerifyRequest,
     TeachRequest,
 )
@@ -29,7 +29,7 @@ from adaptive.domains import get_pack, available_packs
 from adaptive.core.session import AdaptiveSession
 from adaptive.core.gaps import select_transfer_problem, make_transfer_check
 from adaptive.core.graph_projection import render_learning_map
-from adaptive.types import Event, GAP_RECOVERED, GAP_RECOVERED_PENDING_TRANSFER
+from adaptive.types import GAP_INTERVENTION_APPLIED, GAP_RECOVERED_PENDING_TRANSFER
 
 app = FastAPI(title="AURA — Adaptive Learning Diagnosis Engine", version="0.1.0")
 
@@ -70,6 +70,18 @@ def _why_asking_rationale(snap) -> str:
     q = snap.selected_question
     top_hyp = snap.top().concept_id if snap.hyps else "unknown"
     return f"AURA selected '{q.id}' (Information Gain maximised) to disambiguate candidate '{top_hyp}' from competing misconception hypotheses."
+
+
+# These IDs are curated as structurally different transfer tasks for their
+# corresponding concept. Being a practice item or having a different ID alone
+# is not sufficient to prove transfer difference.
+CURATED_TRANSFER_ITEMS = {
+    "binary_search": {"bs_practice_first_occurrence"},
+    "boundary_handling": {"bs_practice_upper_bound"},
+    "golgi": {"bio_reassess_golgi"},
+    "protein_processing": {"bio_practice_secretion"},
+    "lysosome": {"bio_practice_lysosome"},
+}
 
 
 def _serialize_snapshot(snap):
@@ -386,21 +398,101 @@ def teach(sid: str, req: TeachRequest):
 
 
 @app.post("/api/session/{sid}/mark-recovered")
-def mark_recovered(sid: str):
+def mark_recovered(sid: str, req: MarkRecoveredRequest):
     data = session_manager.get_or_404(sid)
     session: AdaptiveSession = data["session"]
     gap = session.current_gap()
 
-    if gap is None and session.gaps.gaps:
-        gap = list(session.gaps.gaps.values())[-1]
-        session.gap = gap
+    if gap is None:
+        raise HTTPException(status_code=409, detail="No diagnosed learning gap exists; original reassessment cannot be recorded.")
 
-    if gap:
-        session.gaps.mark_original_recovered(gap, {"retry": "passed", "test_failures": 0})
+    if gap.status != GAP_INTERVENTION_APPLIED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Original reassessment requires status {GAP_INTERVENTION_APPLIED!r}; current status is {gap.status!r}.",
+        )
+
+    original_problem_id = req.original_problem_id or (
+        session.active_event.event_id if session.active_event else None
+    )
+    if not original_problem_id:
+        raise HTTPException(status_code=409, detail="No original problem/evidence ID is available for reassessment.")
+
+    if not req.passed:
+        return {
+            "gap": _serialize_gap(gap),
+            "recovered": False,
+            "message": "Original reassessment did not pass. Transfer verification is unavailable until the original problem passes.",
+        }
+
+    session.gaps.mark_original_recovered(
+        gap,
+        {
+            "retry": "passed",
+            "note": req.note,
+            "original_problem_id": original_problem_id,
+        },
+    )
+    data["pending_transfer_problem_id"] = None
+    data["pending_transfer_original_problem_id"] = original_problem_id
 
     return {
         "gap": _serialize_gap(gap),
-        "message": "Gap moved to recovered_pending_transfer. Transfer verification required.",
+        "recovered": False,
+        "message": "Original reassessment passed. Gap remains recovered_pending_transfer until a curated transfer task passes.",
+    }
+
+
+@app.get("/api/session/{sid}/transfer-problem")
+def get_transfer_problem(sid: str):
+    data = session_manager.get_or_404(sid)
+    session: AdaptiveSession = data["session"]
+    pack = data["pack"]
+    gap = session.current_gap()
+
+    if gap is None:
+        raise HTTPException(status_code=409, detail="No diagnosed learning gap exists; no transfer task can be selected.")
+    if gap.status != GAP_RECOVERED_PENDING_TRANSFER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transfer task requires status {GAP_RECOVERED_PENDING_TRANSFER!r}; current status is {gap.status!r}.",
+        )
+
+    original_problem_id = (gap.reassessment_result or {}).get("original_problem_id")
+    if not original_problem_id:
+        raise HTTPException(status_code=409, detail="Original reassessment must identify the source problem before selecting transfer.")
+
+    curated_ids = CURATED_TRANSFER_ITEMS.get(gap.concept_id, set())
+    curated_items = [q for q in pack.items if q.id in curated_ids]
+    transfer_item = select_transfer_problem(
+        curated_items,
+        gap.concept_id,
+        original_problem_id=original_problem_id,
+        exclude_ids=session.asked_question_ids,
+    )
+
+    if transfer_item is None:
+        data["pending_transfer_problem_id"] = None
+        data["pending_transfer_original_problem_id"] = original_problem_id
+        return {
+            "available": False,
+            "message": f"No unused curated transfer task is available for concept {gap.concept_id!r}. Recovery remains unverified.",
+            "gap": _serialize_gap(gap),
+            "original_problem_id": original_problem_id,
+        }
+
+    # Persist the offered task so the verify endpoint cannot accept an arbitrary
+    # or stale item ID. This task is also excluded from subsequent selections.
+    session.asked_question_ids.add(transfer_item.id)
+    data["pending_transfer_problem_id"] = transfer_item.id
+    data["pending_transfer_original_problem_id"] = original_problem_id
+    return {
+        "available": True,
+        "message": "Curated same-concept transfer task selected; solve this structurally different task before recovery can be verified.",
+        "gap": _serialize_gap(gap),
+        "transfer_problem": _serialize_question(transfer_item),
+        "original_problem_id": original_problem_id,
+        "structurally_different": True,
     }
 
 
@@ -412,46 +504,55 @@ def verify_transfer(sid: str, req: TransferVerifyRequest):
     gap = session.current_gap()
 
     if gap is None:
-        if session.gaps.gaps:
-            gap = list(session.gaps.gaps.values())[-1]
-            session.gap = gap
-        elif getattr(session, "active_hyps", None) and session.active_event:
-            target = session.active_event.concepts[0]
-            top = session.engine.top_hypothesis(session.active_hyps)
-            gap = session.gaps.materialize(target, top, session.active_event, pack.graph, session.state)
-            session.gap = gap
-        else:
-            target = pack.items[0].concept_id
-            hyps = session.engine.generate_hypotheses(target)
-            top = session.engine.top_hypothesis(hyps)
-            dummy_ev = Event(event_id=str(uuid.uuid4()), session_id=sid, timestamp=_iso_now(), subject=pack.subject, concepts=[target], activity="transfer", input_mode="code")
-            gap = session.gaps.materialize(target, top, dummy_ev, pack.graph, session.state)
-            session.gap = gap
+        raise HTTPException(status_code=409, detail="No diagnosed learning gap exists; transfer cannot create one.")
 
-    if gap.status not in (GAP_RECOVERED_PENDING_TRANSFER, GAP_RECOVERED):
-        session.gaps.mark_original_recovered(gap, {"retry": "passed"})
-
-    transfer_item = select_transfer_problem(
-        pack.items,
-        gap.misconception_class,
-        exclude_ids=session.asked_question_ids,
-    )
-    if transfer_item is None:
-        transfer_item = select_transfer_problem(
-            pack.items,
-            gap.concept_id,
-            exclude_ids=session.asked_question_ids,
+    if gap.status != GAP_RECOVERED_PENDING_TRANSFER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transfer verification requires {GAP_RECOVERED_PENDING_TRANSFER!r}; current status is {gap.status!r}. Complete intervention and original reassessment first.",
         )
-    if transfer_item is None and pack.items:
-        transfer_item = pack.items[0]
+
+    expected_problem_id = data.get("pending_transfer_problem_id")
+    expected_original_id = data.get("pending_transfer_original_problem_id")
+    if not expected_problem_id or not expected_original_id:
+        raise HTTPException(status_code=409, detail="No eligible transfer task is pending. Request /transfer-problem first.")
+
+    if req.transfer_problem_id != expected_problem_id:
+        raise HTTPException(status_code=400, detail="Transfer task ID does not match the task selected for this session.")
+    if req.original_problem_id != expected_original_id:
+        raise HTTPException(status_code=400, detail="Original problem ID does not match the recorded reassessment.")
+    if not req.structurally_different:
+        raise HTTPException(status_code=400, detail="Structural-difference confirmation is required for transfer verification.")
+
+    transfer_item = next((q for q in pack.items if q.id == req.transfer_problem_id), None)
+    curated_ids = CURATED_TRANSFER_ITEMS.get(gap.concept_id, set())
+    if (
+        transfer_item is None
+        or transfer_item.id not in curated_ids
+        or transfer_item.concept_id != gap.concept_id
+        or transfer_item.kind not in ("practice", "reassessment")
+        or transfer_item.id == expected_original_id
+    ):
+        raise HTTPException(status_code=400, detail="Selected task is not a valid curated transfer task for this gap.")
+
+    confirmed_structural_difference = (
+        req.structurally_different
+        and transfer_item.id in curated_ids
+        and transfer_item.concept_id == gap.concept_id
+        and transfer_item.id != expected_original_id
+    )
+    if not confirmed_structural_difference:
+        raise HTTPException(status_code=400, detail="The selected task lacks confirmed structural difference.")
 
     check = make_transfer_check(
         transfer_item,
-        original_problem_id=None,
+        original_problem_id=expected_original_id,
         passed=req.passed,
         note=req.note,
+        structurally_different=confirmed_structural_difference,
     )
     session.gaps.verify_transfer(gap, check)
+    data["pending_transfer_problem_id"] = None
 
     return {
         "gap": _serialize_gap(gap),
@@ -462,6 +563,11 @@ def verify_transfer(sid: str, req: TransferVerifyRequest):
             "structurally_different": check.structurally_different,
             "evaluation_note": check.evaluation_note,
         },
+        "message": (
+            "Transfer verified; learning gap recovered."
+            if gap.status == "recovered" and gap.transfer_verified
+            else "Transfer did not pass. The learning gap is active again."
+        ),
     }
 
 

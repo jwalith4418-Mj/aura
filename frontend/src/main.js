@@ -519,36 +519,96 @@ async function runStep4DecideAndTeach() {
 
   document.getElementById('panels-container').appendChild(cloneTeach);
 
-  // STAGE 6: TRANSFER VERIFICATION
+  // STAGE 6: ORIGINAL REASSESSMENT, THEN TRANSFER VERIFICATION
   updateStepIndicators(6);
   const tplTransfer = document.getElementById('tpl-transfer');
   const cloneTransfer = tplTransfer.content.cloneNode(true);
-
-  const transferPrompt = state.domain === 'DSA'
-    ? "def first_occurrence(arr, target):\n    lo, hi = 0, len(arr)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid\n    return lo if lo < len(arr) and arr[lo] == target else -1"
-    : "Fill in: proteins made by ribosomes on the rough ER are transported in vesicles to the ___ for sorting and packaging.";
-
-  cloneTransfer.querySelector('.transfer-prompt').textContent = transferPrompt;
-
+  const promptNode = cloneTransfer.querySelector('.transfer-prompt');
+  promptNode.textContent =
+    'First confirm that the original problem passes after the intervention. AURA will then load a curated, structurally different task on the same concept. Demo evidence is simulated.';
   const btnVerify = cloneTransfer.querySelector('.btn-submit-transfer');
+  const resultNode = btnVerify.nextElementSibling;
+  let transferData = null;
+
+  const transferOutcome = document.createElement('select');
+  transferOutcome.setAttribute('aria-label', 'Simulated transfer outcome');
+  transferOutcome.className = 'transfer-outcome-select';
+  transferOutcome.hidden = true;
+  [
+    ['passed', 'Simulated transfer result: passed'],
+    ['failed', 'Simulated transfer result: failed'],
+  ].forEach(([value, label]) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    transferOutcome.appendChild(option);
+  });
+  promptNode.insertAdjacentElement('afterend', transferOutcome);
+
+  btnVerify.textContent = 'Confirm original pass & load transfer task';
   btnVerify.onclick = async () => {
     btnVerify.disabled = true;
-    btnVerify.textContent = 'Verifying Transfer Challenge...';
-
     try {
-      const verifyRes = await api.verifyTransfer(state.sessionId, true, "Structurally different problem passed");
+      if (!transferData) {
+        const originalRes = await api.markOriginalRecovered(
+          state.sessionId,
+          true,
+          'Demo learner explicitly confirmed the original reassessment passed',
+        );
+        if (!originalRes.gap || originalRes.gap.status !== 'recovered_pending_transfer') {
+          resultNode.classList.remove('hidden');
+          resultNode.textContent = originalRes.message || 'Original reassessment is not verified; transfer remains unavailable.';
+          btnVerify.textContent = 'Transfer unavailable';
+          return;
+        }
 
-      const resDiv = btnVerify.nextElementSibling;
-      resDiv.classList.remove('hidden');
-      resDiv.innerHTML = `
-        <div class="result-row"><strong>Transfer Verified:</strong> <span class="text-green-600">${verifyRes.gap.transfer_verified}</span></div>
-        <div class="result-row"><strong>Gap Lifecycle Status:</strong> <span class="badge badge-green">${verifyRes.gap.status}</span></div>
+        const selected = await api.getTransferProblem(state.sessionId);
+        if (!selected.available || !selected.transfer_problem) {
+          resultNode.classList.remove('hidden');
+          resultNode.textContent = selected.message || 'No eligible transfer task is available. Recovery remains unverified.';
+          btnVerify.textContent = 'Transfer unavailable';
+          return;
+        }
+
+        transferData = selected;
+        promptNode.textContent =
+          `Curated transfer task (${selected.transfer_problem.id}): ${selected.transfer_problem.prompt}`;
+        transferOutcome.hidden = false;
+        resultNode.classList.remove('hidden');
+        resultNode.textContent = 'Original reassessment passed. Status is recovered_pending_transfer; report the simulated transfer outcome next.';
+        btnVerify.textContent = 'Submit simulated transfer result';
+        btnVerify.disabled = false;
+        return;
+      }
+
+      btnVerify.textContent = 'Verifying Transfer Challenge...';
+      const passed = transferOutcome.value === 'passed';
+      const verifyRes = await api.verifyTransfer(
+        state.sessionId,
+        passed,
+        passed ? 'Demo transfer task reported as passed' : 'Demo transfer task reported as failed',
+        transferData.transfer_problem.id,
+        transferData.original_problem_id,
+        transferData.structurally_different,
+      );
+
+      resultNode.classList.remove('hidden');
+      resultNode.innerHTML = `
+        <div class="result-row"><strong>Transfer Verified:</strong> <span>${verifyRes.gap.transfer_verified}</span></div>
+        <div class="result-row"><strong>Gap Lifecycle Status:</strong> <span class="badge">${verifyRes.gap.status}</span></div>
         <div class="result-row"><strong>Recovery Confidence:</strong> ${(verifyRes.gap.recovery_confidence * 100).toFixed(1)}%</div>
+        <div class="result-row">${verifyRes.message}</div>
       `;
 
-      showRecovery();
+      if (verifyRes.gap.status === 'recovered' && verifyRes.gap.transfer_verified === true) {
+        showRecovery(verifyRes.gap);
+      } else {
+        btnVerify.textContent = 'Transfer did not verify recovery';
+      }
     } catch (err) {
-      alert("Transfer verification failed: " + err.message);
+      alert('Transfer verification failed: ' + err.message);
+      btnVerify.textContent = transferData ? 'Retry transfer submission' : 'Retry original reassessment';
+      btnVerify.disabled = false;
     }
   };
 
@@ -562,7 +622,11 @@ async function runStep4DecideAndTeach() {
 // ---------------------------------------------------------------------------
 // STAGE 6 SUCCESS: RECOVERY VERIFIED
 // ---------------------------------------------------------------------------
-function showRecovery() {
+function showRecovery(gap) {
+  // The success screen is gated by the authoritative API lifecycle state.
+  if (!gap || gap.status !== 'recovered' || gap.transfer_verified !== true) {
+    return;
+  }
   const tpl = document.getElementById('tpl-recovery');
   const clone = tpl.content.cloneNode(true);
 

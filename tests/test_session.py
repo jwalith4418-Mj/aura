@@ -88,8 +88,17 @@ class TestAdaptiveSession(unittest.TestCase):
         # transfer problem (structurally different) passes -> recovered
         from adaptive.core.gaps import make_transfer_check, select_transfer_problem
 
-        transfer_item = select_transfer_problem(self.pack.items, "binary_search")
-        check = make_transfer_check(transfer_item, original_problem_id=None, passed=True)
+        transfer_item = select_transfer_problem(
+            self.pack.items,
+            "binary_search",
+            original_problem_id=event.event_id,
+        )
+        check = make_transfer_check(
+            transfer_item,
+            original_problem_id=event.event_id,
+            passed=True,
+            structurally_different=True,
+        )
         self.session.gaps.verify_transfer(gap, check)
         self.assertEqual(gap.status, GAP_RECOVERED)
         self.assertTrue(gap.transfer_verified)

@@ -63,11 +63,39 @@ def test_random_monkey_dsa_loops():
         assert r.status_code == 200
 
         passed_transfer = rng.choice([True, False])
-        r = client.post(f"/api/session/{sid}/verify-transfer", json={"passed": passed_transfer, "note": "monkey test"})
-        assert r.status_code == 200
-        vr = r.json()
-        assert "gap" in vr
-        assert vr["gap"]["transfer_verified"] is passed_transfer
+        original = client.post(
+            f"/api/session/{sid}/mark-recovered",
+            json={"passed": True, "note": "monkey original reassessment"},
+        )
+        if original.status_code == 200:
+            assert original.json()["gap"]["status"] == "recovered_pending_transfer"
+            selected = client.get(f"/api/session/{sid}/transfer-problem")
+            assert selected.status_code == 200
+            task_data = selected.json()
+            if task_data["available"]:
+                task = task_data["transfer_problem"]
+                r = client.post(
+                    f"/api/session/{sid}/verify-transfer",
+                    json={
+                        "passed": passed_transfer,
+                        "note": "monkey transfer result",
+                        "transfer_problem_id": task["id"],
+                        "original_problem_id": task_data["original_problem_id"],
+                        "structurally_different": task_data["structurally_different"],
+                    },
+                )
+                assert r.status_code == 200
+                vr = r.json()
+                assert "gap" in vr
+                assert vr["gap"]["transfer_verified"] is passed_transfer
+                assert vr["gap"]["status"] == ("recovered" if passed_transfer else "active_blocker")
+            else:
+                assert task_data["gap"]["status"] == "recovered_pending_transfer"
+                assert task_data["gap"]["transfer_verified"] is False
+        else:
+            assert original.status_code == 409
+            current = client.get(f"/api/session/{sid}/gap").json()["gap"]
+            assert current is None or current["status"] != "recovered"
 
         client.get(f"/api/session/{sid}/map")
         client.get(f"/api/session/{sid}/privacy")
@@ -111,8 +139,34 @@ def test_random_monkey_biology_loops():
         client.get(f"/api/session/{sid}/retrieve", params={"target": "golgi", "query": "packages proteins"})
         client.post(f"/api/session/{sid}/teach", json={"target": "golgi"})
 
-        r = client.post(f"/api/session/{sid}/verify-transfer", json={"passed": True})
-        assert r.status_code == 200
+        original = client.post(
+            f"/api/session/{sid}/mark-recovered",
+            json={"passed": True, "note": "monkey biology reassessment"},
+        )
+        if original.status_code == 200:
+            selected = client.get(f"/api/session/{sid}/transfer-problem")
+            assert selected.status_code == 200
+            task_data = selected.json()
+            if task_data["available"]:
+                task = task_data["transfer_problem"]
+                r = client.post(
+                    f"/api/session/{sid}/verify-transfer",
+                    json={
+                        "passed": True,
+                        "transfer_problem_id": task["id"],
+                        "original_problem_id": task_data["original_problem_id"],
+                        "structurally_different": task_data["structurally_different"],
+                        "note": "monkey biology transfer",
+                    },
+                )
+                assert r.status_code == 200
+                assert r.json()["gap"]["status"] == "recovered"
+                assert r.json()["gap"]["transfer_verified"] is True
+            else:
+                assert task_data["gap"]["status"] == "recovered_pending_transfer"
+                assert task_data["gap"]["transfer_verified"] is False
+        else:
+            assert original.status_code == 409
 
         client.post(f"/api/session/{sid}/close")
 
@@ -122,9 +176,18 @@ def test_out_of_order_endpoint_calls():
     r = client.post("/api/session/start", json={"domain": "DSA"})
     sid = r.json()["session_id"]
 
-    r = client.post(f"/api/session/{sid}/verify-transfer", json={"passed": True, "note": "direct verify"})
-    assert r.status_code == 200
-    assert r.json()["gap"]["transfer_verified"] is True
+    r = client.post(
+        f"/api/session/{sid}/verify-transfer",
+        json={
+            "passed": True,
+            "transfer_problem_id": "bs_practice_first_occurrence",
+            "original_problem_id": "unknown-original",
+            "structurally_different": True,
+            "note": "direct verify should be rejected",
+        },
+    )
+    assert r.status_code == 409
+    assert client.get(f"/api/session/{sid}/gap").json()["gap"] is None
 
     r = client.post(f"/api/session/{sid}/teach", json={"target": "binary_search"})
     assert r.status_code == 200
@@ -149,7 +212,16 @@ def test_concurrent_multi_sessions():
         client.get(f"/api/session/{sid}/diagnose")
         client.post(f"/api/session/{sid}/decide")
         client.post(f"/api/session/{sid}/teach", json={"target": "binary_search"})
-        client.post(f"/api/session/{sid}/verify-transfer", json={"passed": True})
+        # Valid-shaped but out-of-order request must not manufacture a gap.
+        client.post(
+            f"/api/session/{sid}/verify-transfer",
+            json={
+                "passed": True,
+                "transfer_problem_id": "bs_practice_first_occurrence",
+                "original_problem_id": "unknown-original",
+                "structurally_different": True,
+            },
+        )
         client.get(f"/api/session/{sid}/map")
         client.get(f"/api/session/{sid}/privacy")
 
